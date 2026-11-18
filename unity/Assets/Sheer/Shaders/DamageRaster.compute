@@ -1,0 +1,205 @@
+// SHEER — GPU rasteriser of the tear state (port of SheerDamage.render in blender/sheer_damage.py).
+// x = u around the leg, y = z along the leg (from _ZMin, 1 m: the rest height on the leg, along the wales below the
+// ankle - SheerDamage). Three maps:
+//   _Out  : R = hole signed distance, G = ladder-band signed distance (both packed: sd/(2*RANGE)+0.5),
+//           B = ladder age (0..1), A = 1 - bagging (stretch marks)
+//   _OutB : RG = displacement of the fabric by the holes (u units, metres): a hole opens without losing yarn - what
+//           filled it is gathered along its outline - so (u, z) - RG is where a piece of yarn sat before ('material'
+//           coordinates: the surface shader draws knit, wales and rungs there and they flow around the holes),
+//           B = lateral coordinate across the ladder that governs this texel (+-1 at its edges, 8 = none),
+//           A = density of the wales here - 1 (bunched beside a hole, spread above / below it)
+//   _OutC : R / G = distance to the ladder's top / bottom end in units of that end's frayed length, B = distance (m)
+//           along the wale to the nearest hole that cuts it (0.08 = none),
+//           A = density of the courses - 1 (bunched above / below a hole: hoods, lips, straps between two holes)
+#pragma kernel Raster
+
+struct HoleG { float u, z, rx, ry, angle, rough, seed, skew, pw, cut, group, pad; };
+struct RunG  { float u, lo, hi, hw, age, seed, wobble, taper, fanTop, fanBot, pad0, pad1; };
+struct MarkG { float u, z, radius, s; };
+
+StructuredBuffer<HoleG> _Holes;
+StructuredBuffer<RunG>  _Runs;
+StructuredBuffer<MarkG> _Marks;
+StructuredBuffer<float> _Circ;          // leg circumference per texture row (m)
+int _NHoles, _NRuns, _NMarks, _W, _H;
+StructuredBuffer<float> _Wide;          // how far tears open sideways per texture row (SheerDamage.Wide)
+float _Range;
+float _ZMin;                            // z of the texture's first row (m)
+RWTexture2D<float4> _Out, _OutB, _OutC;
+
+float wrapu(float d) { return d - floor(d + 0.5); }
+float smin_(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * 0.25; }
+float smax_(float a, float b, float k) { return -smin_(-a, -b, k); }
+float smooth_(float e0, float e1, float x) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }
+
+// One hole at (dx, dy) metres from its centre: signed distance to its outline (first order), how far outside the
+// outline the point is (rho: 1 on it) and the displacement of the fabric there.
+void holeAt(HoleG h, float dx, float dy, out float sd, out float rho, out float2 D)
+{
+    float ca = cos(h.angle), sa = sin(h.angle);
+    float qx = ca * dx + sa * dy, qy = -sa * dx + ca * dy;
+    float ang = atan2(qy, qx), s = h.seed * 6.2831853;
+    // outline: broad lobes + corners and nicks (the original's holes are never smooth blobs)
+    float n = 0.5 * sin(2.0 * ang + s) + 0.35 * sin(3.0 * ang + s * 1.7) + 0.20 * sin(5.0 * ang + s * 2.3) + 0.08 * sin(8.0 * ang + s * 3.1)
+            + 0.05 * sin(13.0 * ang + s * 4.3) + 0.03 * sin(21.0 * ang + s * 5.9);
+    n += 0.16 * pow(abs(sin(3.5 * ang + s * 2.9)), 12.0) - 0.2 * pow(abs(sin(2.5 * ang + s * 6.1)), 16.0);
+    float rx = max(h.rx * (1.0 + n * h.rough), 1e-5), ry = max(h.ry * (1.0 + n * h.rough), 1e-5);
+    float Y = qy / ry;
+    float rxe = rx * clamp(1.0 - h.skew * Y, 0.3, 1.7);          // egg / teardrop: narrower toward +Y for skew > 0
+    float X = qx / rxe;
+    float p = max(h.pw, 2.0);
+    float k = pow(pow(abs(X), p) + pow(abs(Y), p) + 1e-12, 1.0 / p);
+    float gk = sqrt(X * X / (rxe * rxe) + Y * Y / (ry * ry)) / max(k, 1e-4);      // |grad k| of the ellipse (close enough)
+    if (h.cut != 0.0)
+    {   // flat side: the outline is cut at |cut| x ry above (cut > 0) or below (cut < 0) the centre
+        float c = abs(h.cut), kc = (h.cut > 0.0 ? Y : -Y) / c;
+        float w = saturate((kc - k) / 0.15 + 0.5);
+        k = smax_(k, kc, 0.15); gk = lerp(gk, 1.0 / (ry * c), w);
+    }
+    sd = (k - 1.0) / max(gk, 1.0);
+    rho = max(k, 1.0);
+    // What a hole displaces: only the yarn within a couple of millimetres of the edge is pushed outward and gathered
+    // there (the loops that filled the hole have unravelled into the ladder). The original's ladder bands stay straight
+    // between two holes and the threads curve round a hole only within ~4 mm of its edge; an area-preserving opening
+    // (the previous version) bent the whole band into an hourglass and piled a dark ring of yarn round every hole.
+    // (4.5 mm at the edge, gone 14 mm out: enough for the courses to arch visibly over a hole and to crowd in a strap)
+    // (0.42 R at the edge, gone 0.9 R out, quadratically: the mapping stays one-to-one - no folds - while the yarn piles
+    //  up toward the edge: threads that crossed the hole now hug its outline, close together at the edge - the rolled
+    //  lip - and further apart outward)
+    // (the push follows the hole's broad shape only - its two lowest lobes - not the nicks and corners of the outline:
+    //  threads next to a ragged edge are still smooth lines)
+    float nS = 0.5 * sin(2.0 * ang + s) + 0.35 * sin(3.0 * ang + s * 1.7);
+    float rxS = max(h.rx * (1.0 + nS * h.rough), 1e-5), ryS = max(h.ry * (1.0 + nS * h.rough), 1e-5);
+    float YS = qy / ryS, rxeS = rxS * clamp(1.0 - h.skew * YS, 0.3, 1.7), XS = qx / rxeS;
+    float kS = pow(pow(abs(XS), p) + pow(abs(YS), p) + 1e-12, 1.0 / p);
+    float gkS = sqrt(XS * XS / (rxeS * rxeS) + YS * YS / (ryS * ryS)) / max(kS, 1e-4);
+    float sdS = (kS - 1.0) / max(gkS, 1.0);
+    float Rs = min(rxeS, ryS);
+    // How much yarn the edge has gathered varies along the outline: here a thick ribbon of threads lies against it (a
+    // lip under the hole, a web toward the next one), there next to nothing (the original at 9.5 s, 4x: no two
+    // stretches of an outline look alike).
+    float gv = 0.5 + 0.5 * (0.6 * sin(ang + s * 7.1) + 0.4 * sin(2.0 * ang + s * 3.3));
+    float d0 = min(0.36 * Rs, 0.008) * lerp(0.22, 1.2, gv * gv * (3.0 - 2.0 * gv)), L = max(0.9 * Rs, 0.004);
+    float sOut = max(sdS, 0.0);
+    float fall = kS < 1.0 ? kS : (1.0 - min(sOut / L, 1.0)) * (1.0 - min(sOut / L, 1.0));
+    float2 nq = float2(qx / (rxeS * rxeS), qy / (ryS * ryS)); nq /= max(length(nq), 1e-9);
+    float2 Dl = nq * (d0 * fall);
+    D = float2(ca * Dl.x - sa * Dl.y, sa * Dl.x + ca * Dl.y);
+}
+
+// All holes at a point: signed distance to the nearest outline (holes of one group run into each other, different
+// groups keep their strap) and the summed displacement (within a group: that of the member the point is closest to).
+// waleD = how far along the leg (m) the nearest hole lies in THIS wale's path - 0.08 where no hole cuts the wales here:
+// a run starts at a hole and travels along the wales it has cut, so the fringe of streaks above and below a hole is as
+// wide as the hole and does not fan out.
+void holesAt(float u, float z, float C, out float hole, out float2 D, out float waleD)
+{
+    hole = _Range; D = 0.0; waleD = 0.08;
+    float gsd = _Range, gid = -1.0, gw = 0.0; float2 gD = 0.0;
+    for (int i = 0; i < _NHoles; i++)
+    {
+        HoleG h = _Holes[i];
+        float dx = wrapu(u - h.u) * C, dy = z - h.z;
+        // (the hole as an upright ellipse is close enough at this distance)
+        float ax = abs(dx) / max(h.rx, 1e-5);
+        // (+ a handicap growing toward the hole's sides: the wales through its middle run furthest - a flame, not a curtain)
+        float axs = smooth_(0.35, 1.12, ax);
+        float wd = abs(dy) - h.ry * sqrt(max(1.0 - ax * ax, 0.0)) + 0.03 * axs * axs + 0.08 * smooth_(0.95, 1.15, ax);
+        waleD = min(waleD, max(wd, 0.0));
+        float ext = max(h.rx * 1.7, h.ry) * 2.5 + 0.004;
+        if (abs(dx) > ext || abs(dy) > ext) continue;
+        float sd, rho; float2 Di;
+        holeAt(h, dx, dy, sd, rho, Di);
+        if (h.group != gid)
+        {
+            hole = min(hole, gsd); if (gw > 0.0) D += gD / gw;
+            gsd = _Range; gid = h.group; gw = 0.0; gD = 0.0;
+        }
+        gsd = smin_(gsd, sd, 0.0028);
+        // (the member's weight fades out before the edge of its box: cut off there, the group's mean displacement jumped
+        //  by a fraction of a millimetre, the thread density - its gradient - spiked along the box's outline and drew a
+        //  thin straight line of gauze with right-angle steps across the leg, review round 5, 17 - 23 s)
+        float w = pow(rho, -8.0) * (1.0 - smooth_(0.7 * ext, ext, max(abs(dx), abs(dy))));
+        gD += Di * w; gw += w;
+    }
+    hole = min(hole, gsd); if (gw > 0.0) D += gD / gw;
+}
+
+[numthreads(8, 8, 1)]
+void Raster(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _W || (int)id.y >= _H) return;
+    float u = (id.x + 0.5) / _W, z = _ZMin + (id.y + 0.5) / _H, C = _Circ[id.y];
+    float hole, run = _Range, age = 0.0, mark = 0.0, waleD, wd1, wd2; float2 D;
+    holesAt(u, z, C, hole, D, waleD);
+    // thread densities: gradients of the material coordinates (wales = lines of constant material u, courses = of z)
+    float gwale = 1.0, gcourse = 1.0;
+    if (_NHoles > 0)
+    {
+        const float hh = 0.00025; float h1, h2; float2 Dx, Dy;
+        holesAt(u + hh / C, z, C, h1, Dx, wd1); holesAt(u, z + hh, C, h2, Dy, wd2);
+        float2 ddx_ = (Dx - D) / hh, ddy_ = (Dy - D) / hh;       // d(D)/dx, d(D)/dy
+        gwale = length(float2(1.0 - ddx_.x, -ddy_.x));
+        gcourse = length(float2(-ddx_.y, 1.0 - ddy_.y));
+    }
+    // ladders live in material coordinates: they bulge around the holes that opened in them
+    float um = u - D.x / C, zm = z - D.y;
+    float bestQ = -1e9, lat = 8.0, tTop = 0.0, tBot = 0.0, rseed = 0.0, rage = 0.0;
+    float q2 = -1e9, lat2 = 8.0, tTop2 = 0.0, tBot2 = 0.0, rage2 = 0.0;          // the runner-up
+    for (int j = 0; j < _NRuns; j++)
+    {
+        RunG r = _Runs[j];
+        // (a row of slits that closed again - a pull let go before it tore, age 0 - is gone: drawn by its band alone it
+        //  stayed as a pale rectangle with square ends for the rest of the session, independent review 2026-11-17)
+        if (r.age < 0.005) continue;
+        if (zm < r.lo - 0.004 || zm > r.hi + 0.004) continue;
+        float tc = clamp(zm, r.lo, r.hi);
+        float wob = (sin(tc * 31.0 + r.seed * 40.0) * 0.6 + sin(tc * 87.0 + r.seed * 13.0) * 0.4) * r.wobble;
+        float dx = wrapu(um - r.u) * C - wob;
+        float e = min(tc - r.lo, r.hi - tc);
+        // (a ladder opens sideways like the holes: ~1.6 x from the knee up, ~0.33 x on the lower shin)
+        float hwF = r.hw * (1.0 + 0.12 * sin(tc * 23.0 + r.seed * 7.0)) * 1.32 * _Wide[id.y];
+        float hw = hwF * (0.15 + 0.85 * smooth_(0.0, r.taper, e));
+        float sd = abs(dx) - hw;
+        float dy = zm - tc;
+        if (abs(dy) > 0.0) sd = sqrt(max(sd, 0.0) * max(sd, 0.0) + dy * dy);
+        run = min(run, sd);
+        if (sd < 0.0) age = max(age, r.age);
+        // the ladder that governs this texel: the one it lies deepest in (whole band before frayed end before margin),
+        // so that one ladder ending inside another never cuts it
+        float sl = dx / max(hwF, 1e-5);
+        float len = max(r.hi - r.lo, 1e-4);
+        float tt = (r.hi - zm) / max(min(r.fanTop, 0.45 * len), 1e-4), tb = (zm - r.lo) / max(min(r.fanBot, 0.45 * len), 1e-4);
+        float q = min(min(tt, tb), 1.5) - max(abs(sl) - 0.7, 0.0) * 2.0;
+        if (abs(sl) < 4.0)
+        {
+            // (|lateral|: only its size is used; signed, two ladders whose bands lie on either side of a texel blended
+            //  through 0 - a fake band centre, fully open, one texel wide: the straight line of review round 5)
+            if (q > bestQ) { q2 = bestQ; lat2 = lat; tTop2 = tTop; tBot2 = tBot; rage2 = rage; bestQ = q; lat = abs(sl); rseed = r.seed; rage = r.age; tTop = tt; tBot = tb; }
+            else if (q > q2) { q2 = q; lat2 = abs(sl); tTop2 = tt; tBot2 = tb; rage2 = r.age; }
+        }
+    }
+    // where two ladders are nearly as deep the fields blend toward the runner-up, so they stay continuous where the
+    // governing ladder changes (picked outright, they jumped there and the bilinear filter blended unrelated values
+    // into a fake ladder edge one texel wide - a thin straight line with right-angle steps, review round 5, 17 - 23 s)
+    if (q2 > -1e8)
+    {
+        // (toward the switch the fields close up - the larger lateral distance, the nearer of each end - and both sides
+        //  meet in the same state: a blend of one ladder's far top with the other's far bottom read as the middle of a
+        //  ladder and opened a line)
+        float wm = smooth_(0.0, 0.8, bestQ - q2);
+        lat = lerp(max(lat, lat2), lat, wm); tTop = lerp(min(tTop, tTop2), tTop, wm); tBot = lerp(min(tBot, tBot2), tBot, wm);
+        rage = lerp(min(rage, rage2), rage, wm);
+    }
+    if (abs(lat) < 1.6) age = max(age, rage);
+    for (int m = 0; m < _NMarks; m++)
+    {
+        MarkG mk = _Marks[m];
+        float ddx = wrapu(u - mk.u) * C, ddz = z - mk.z;
+        float w = 1.0 - smooth_(0.0, mk.radius, sqrt(ddx * ddx + ddz * ddz));
+        mark = 1.0 - (1.0 - mark) * (1.0 - w * w * mk.s);
+    }
+    _Out[id.xy] = float4(saturate(hole / (2.0 * _Range) + 0.5), saturate(run / (2.0 * _Range) + 0.5), saturate(age), saturate(1.0 - mark));
+    _OutB[id.xy] = float4(D.x / C, D.y, lat, clamp(gwale, 0.0, 8.0) - 1.0);
+    _OutC[id.xy] = float4(clamp(tTop, -4.0, 64.0), clamp(tBot, -4.0, 64.0), waleD, clamp(gcourse, 0.0, 8.0) - 1.0);
+}

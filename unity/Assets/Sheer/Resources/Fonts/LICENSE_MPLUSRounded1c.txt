@@ -1,0 +1,4 @@
+M PLUS Rounded 1c (Bold, Medium) - Copyright 2016 The M+ FONTS Project Authors (https://github.com/coz-m/MPLUS_FONTS)
+and the Rounded M+ authors. Licensed under the SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+Obtained from the Google Fonts repository (github.com/google/fonts, ofl/mplusrounded1c). The font is bundled unmodified
+with this game for its user interface; it is not sold by itself.

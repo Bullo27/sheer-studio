@@ -1,0 +1,578 @@
+// SHEER — the stocking as a leashed, pre-stretched knit membrane, one lattice per leg (NU around x NV along) from the toes
+// to under the skirt: rows are cross-sections of the tube by planes - horizontal on the leg, turning round the ankle and
+// heel about the bend's axis, vertical along the foot (ClothLattice in TightsCloth.cs) - so each column is one wale from
+// the toe seam up the leg. GPU port of tools/sim/leash.py (the reference implementation, legs only).
+//
+// One substep (3840 per second) = two Jacobi passes, every node reading only its neighbours:
+//   Springs: from the predicted positions (damped Verlet + friction leash to the worn rest position, Coulomb-like: it
+//            saturates), the 8 knit threads of the node. Every thread is pre-stretched (its natural length is
+//            (1 - shrink) of its worn length), has a soft elastic range and a lock (strain limit). The part of the rest
+//            tension that friction holds on a real leg (_F0) is subtracted while the fabric lies on the leg, so the worn
+//            state is an exact equilibrium and an untouched leg stays asleep.
+//   Finish:  the knit cannot pass through itself (neighbours keep their order in height / angle about the leg axis,
+//            fabric lying on the leg cannot be gathered below `jam` of its worn spacing), tether to the pinch (no thread
+//            path longer than its locked length), the pinched patch itself (kinematic, gathered), collision with the leg
+//            (radial height field R(theta, y) about the leg axis), pinned ankle / top rows; then the prediction for the
+//            next substep (so that the spring pass reads one texel per neighbour).
+// Resolve (once per frame): displacement + lift, principal stretches + direction, normal change -> textures for the
+// vertex / fragment shaders (SheerCloth.hlsl).
+#pragma kernel Init
+#pragma kernel Reset
+#pragma kernel Predict
+#pragma kernel Springs
+#pragma kernel Finish
+#pragma kernel Resolve
+#pragma kernel GripMask
+#pragma kernel GripBlur
+
+#define TWO_PI 6.28318530717958647692
+#define PI 3.14159265358979323846
+
+Texture2D<float4> _Rest;            // worn rest position X (xyz), leg radius R (w)
+Texture2D<float4> _F0;              // friction-held part of the rest tension (xyz)
+Texture2D<float4> _L1, _L2;         // worn lengths of the 8 threads of a node (OFFS order)
+Texture2D<float4> _X;               // position (xyz), height above the leg at the last collision (w)
+Texture2D<float4> _Xp;              // previous position
+Texture2D<float4> _P;               // predicted position (xyz), height above the leg (w)
+Texture2D<float4> _Y;               // after the spring pass
+RWTexture2D<float4> _Out;
+RWTexture2D<float4> _Out2;
+RWTexture2D<float4> _Out3;
+RWTexture2D<float4> _OutDisp;       // displacement (xyz), lift above the leg (w)
+RWTexture2D<float4> _OutTens;       // largest / smallest in-plane stretch, direction of the largest (cos 2a, sin 2a; a from +u)
+RWTexture2D<float4> _OutNrm;        // change of the surface normal (xyz)
+StructuredBuffer<float2> _Axis;     // each row's centre in its own plane (a = x, B; ClothLattice)
+Texture2D<float2> _PinMask;         // per node: held (r) and held softened over a few nodes (g) - the sole on the floor
+Texture2D<float2> _ZTex;            // per node: Z = where it is along its wale (m; the rest height on the leg)
+float4 _Floor;                      // a floor (normal xyz, height w); zero = none
+
+int _NU, _NV;
+float _Y0, _Dy;                     // row parameter S of row 0, row spacing in S
+float4 _Sock;                       // the bend's axis: height yc, depth zc; its radius in S (rho); S at its top (sc)
+float _RelLeash;                      // while the fingers let go (recoil): the whole sail is drawn back with the patch
+float _Damp, _KSoft, _KDiag, _KComp, _KCs, _KLeash, _Slip, _H0, _H1, _KRel, _Omega, _PinRows, _PinFade;
+float _PinchR, _Gather, _Reach, _Jam, _Fold, _OrderH0, _OrderH1;
+float _PinchElong, _GatherAlong;     // the fingers hold a FOLD: the patch _PinchElong x longer along the wale, bunched to _GatherAlong there (1 / _Gather = round)
+float _JamH0, _JamH1;               // fabric this close to the skin (lift, m) cannot be gathered below _Jam: it piles up ahead of the hand
+float4 _DragU;                      // the hand's drag over the skin: arc round the tube (m), along the wale (m), its fall-off length L (m; 0 = none)
+float _DragK;                       // how firmly the fabric round the pinch goes along with it (0..1 per substep)
+float _TopPinY;                     // rest height above which the stocking is held (a thigh-high's welt); 2 = none
+float _Press, _PressH0, _PressH1;   // gathered fabric within millimetres of the skin is pressed onto it (m per substep; lift where it fades, m)
+float4 _Lock;                       // strain where the knit locks: around, along, diagonal
+float4 _Shrink;                     // pre-stretch: around, along, diagonal
+float _Held;                        // 1 while a hand holds this leg's fabric
+float4 _PinchC, _PinchA;            // grab point at rest, where the hand holds it now
+float _GrabTheta;
+float _KFar;                        // hold on the far side of the leg from the grab while the hand pulls
+float _ReachU;                      // the tether's reach ROUND the leg (x the knit's lock), 0 = as along it
+int _GrabI, _GrabJ;
+float4 _PinGive;                    // how far the held ankle band gives toward the hand now (rest space), on the hand's side of the leg
+// THE OTHER LEG (user, 2026-11-16: a tent pulled from one calf toward the other leg went into it): its worn surface, and
+// per height bin the map from this leg's rest frame to the other's as both are posed now (TightsSim: cos, sin of the turn,
+// shift x, z). Fabric lifted off this leg is kept _OtherGap off it.
+Texture2D<float4> _ORest;
+StructuredBuffer<float2> _OAxis;
+StructuredBuffer<float4> _Rel;
+int _RelBase;
+float _RelBins, _OtherGap;
+float _MaxStep;                     // the most a node moves in one substep (m)
+// THE FINGERS HOLD ONLY FABRIC THAT IS THERE (GripMask, once per grab: TightsCloth.BeginGrab). Per node, 1 where it is joined
+// to the grab point through intact knit along the straight line from it; 0 behind a hole, and along the wale inside a ladder
+// (its loops are gone: nothing joins the rungs above to those below). r: as it is - the fingers' patch; g: softened over
+// ~1 cm - the tether and the drag field fade out round a hole's 'shadow' instead of shearing the fabric along a line.
+// (The lattice is whole where the picture has holes: a pinch beside a hole carried the hole off rigidly in its 1.4 x 4.9 cm
+// patch - out of the leg into the sail, the thigh behind it left looking intact, the ladder below dragged into an S, review
+// 14 at 5.1 - 5.9 s. The original's pull 3.7 cm from its hole stretched the hole's near edge 3 x as far as its far edge.)
+Texture2D<float4> _DmgTex;          // the leg's damage map (r: hole SDF, g: ladder SDF; (sd / range) / 2 + 0.5)
+float4 _DmgInfo;                    // its width, height (texels), z of its first row, SDF range (m); width 0 = no map
+RWTexture2D<float2> _OutGrip;
+Texture2D<float2> _Grip;
+
+// (di around, dj along): 2 around, 2 along, 4 diagonals — same order as OFFS in leash.py
+static const int2 OFFS[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, -1), int2(-1, 1), int2(1, -1) };
+
+int WrapU(int i) { i += i < 0 ? _NU : 0; i -= i >= _NU ? _NU : 0; return i; }
+int2 Nb(int2 p, int2 o) { return int2(WrapU(p.x + o.x), clamp(p.y + o.y, 0, _NV - 1)); }
+float Valid(int2 p, int2 o) { int j = p.y + o.y; return (j >= 0 && j < _NV) ? 1.0 : 0.0; }
+float Sq(float x) { return x * x; }
+
+// 1 for fabric lying on the leg, 0 once it is lifted more than _H1
+float Contact(float h) { float t = saturate((h - _H0) / (_H1 - _H0)); return 1.0 - t * t * (3.0 - 2.0 * t); }
+
+// 1 for fabric on or just above the skin (it cannot be gathered tighter than _Jam), 0 once it is lifted more than _JamH1
+// (there it may fold). Wider than Contact: the fold the fingers hold stands a few millimetres off the skin, and with the
+// contact's 0.5 - 3 mm it counted as 'in the air' - the fabric ahead of a pinch dragged over the leg was squeezed to a
+// twentieth in one row, a cliff with a hard straight edge that read as a folded sheet of paper (free-play sweep
+// 2026-11-17, pulls 6 / 12 / 13 / 17); kept at _Jam it piles up ahead of the hand over centimetres, as gathered nylon does
+float JamW(float h) { float t = saturate((h - _JamH0) / max(_JamH1 - _JamH0, 1e-6)); return 1.0 - t * t * (3.0 - 2.0 * t); }
+
+// 1 near the leg, 0 for fabric lifted more than _OrderH1 (the order constraint only holds near the leg)
+float Near(float h) { float t = saturate((_OrderH1 - h) / (_OrderH1 - _OrderH0)); return t * t * (3.0 - 2.0 * t); }
+
+float LeashPin(int2 p)
+{
+    float r = min(p.y, _NV - 1 - p.y);
+    float f = saturate((r - _PinRows) / max(_PinFade, 1.0)); f = f * f * (3.0 - 2.0 * f);
+    return max((1.0 - f) * (_PinRows > 0.0 ? 1.0 : 0.0), _PinMask[p].g) * 0.2;
+}
+
+// Where the held rows hold a node. The ankle band is not nailed to the leg: pulled hard from just above it, the fabric
+// over heel and instep feeds the sail (the original's ankle sails start at the heel and reach twice as far as a column
+// of fabric pinned at the ankle could stretch). TightsCloth moves the band toward the hand on the hand's side of the leg.
+float3 PinRest(int2 p, float3 X)
+{
+    if (p.y > _NV / 2) return X;
+    float f = saturate((p.y - _PinRows) / _PinFade); f = f * f * (3.0 - 2.0 * f);
+    float dth = p.x * (TWO_PI / _NU) - _GrabTheta + PI; dth = dth - TWO_PI * floor(dth / TWO_PI) - PI;
+    float w = saturate(1.0 - abs(dth) / 1.5); w = w * w * (3.0 - 2.0 * w);
+    return X + _PinGive.xyz * (w * (1.0 - f));
+}
+
+// _PinGive.w: how far the held band may lift OFF the leg on the hand's side (TightsCloth: grabbed just above it) - the pin
+// then only holds it along and round the leg, and onto it from outside, not down onto the skin
+float PinFreeW(int2 p)
+{
+    if (p.y > _NV / 2 || _PinGive.w <= 0.0) return 0.0;
+    float dth = p.x * (TWO_PI / _NU) - _GrabTheta + PI; dth = dth - TWO_PI * floor(dth / TWO_PI) - PI;
+    float w = saturate(1.0 - abs(dth) / 1.5); w = w * w * (3.0 - 2.0 * w);
+    return _PinGive.w * w;
+}
+// ---- the tube's geometry (ClothLattice.S): row parameter S of a point, its in-plane coordinate B, the direction in which
+// B grows (eB; the other in-plane direction is x), the direction along the wales (eT, S growing) and dl / dS there
+float SockS(float3 p, out float B, out float3 eB, out float3 eT, out float met)
+{
+    float yc = _Sock.x, zc = _Sock.y;
+    B = p.z; eB = float3(0.0, 0.0, 1.0); eT = float3(0.0, 1.0, 0.0); met = 1.0;
+    if (p.y >= yc) return _Sock.w + (p.y - yc);
+    if (p.z > zc)
+    {
+        float h = yc - p.y, d = p.z - zc, q = max(sqrt(h * h + d * d), 1e-9);
+        B = zc + q; eB = float3(0.0, -h / q, d / q); eT = float3(0.0, d / q, h / q); met = q / _Sock.z;
+        return _Sock.w - _Sock.z * atan2(h, d);
+    }
+    B = zc + (yc - p.y); eB = float3(0.0, -1.0, 0.0); eT = float3(0.0, 0.0, 1.0); met = 1.0;
+    return _Sock.w - _Sock.z * (0.5 * PI) - (zc - p.z);
+}
+float RowF(float S) { return clamp((S - _Y0) / _Dy, 0.0, _NV - 1.001); }
+
+// out of the leg at the rest point X, in its row's plane
+float3 PinRadial(float3 X)
+{
+    float B, met; float3 eB, eT; float S = SockS(X, B, eB, eT, met);
+    float2 ax = _Axis[clamp((int)round((S - _Y0) / _Dy), 0, _NV - 1)];
+    float3 r = float3(X.x - ax.x, 0.0, 0.0) + eB * (B - ax.y); float l = max(length(r), 1e-9);
+    return r / l;
+}
+
+// damped Verlet + leash to the rest position: x = now, xp = one substep ago, cw = contact with the leg
+float3 PredictPos(float3 x, float3 xp, float3 X, float cw, int2 p)
+{
+    float3 y = x + (x - xp) * _Damp;
+    float3 pr = PinRest(p, X), d = X - y, dpin = pr - y;
+    float fw = PinFreeW(p);
+    if (fw > 0.0) { float3 nr = PinRadial(X); dpin += nr * (max(dot(y - pr, nr), 0.0) * fw); }
+    float lw;
+    if (_Held > 0.5)
+    {
+        lw = _KLeash * cw;
+        if (_Slip > 0.0) lw /= 1.0 + length(d) / _Slip;
+        // The far side of the leg from the grab (beyond ~100 deg round it) is pressed onto the skin by the very hoop the
+        // hand tightens: its friction holds it, also where it has lifted a little. Without it an ankle pull drew the whole
+        // ring toward the hand - a detached 'cuff' with a fold all round the ankle (review round 6).
+        float dth = p.x * (TWO_PI / _NU) - _GrabTheta + PI; dth = dth - TWO_PI * floor(dth / TWO_PI) - PI;
+        lw = max(lw, _KFar * smoothstep(1.6, 2.4, abs(dth)));
+        // The FOOT's knit holds on: drawn over the convex instep by the foot's girth and pressed onto the floor at the sole,
+        // its friction is several times the leg's. With the leg's, an ankle pull drew the instep's fabric up into dark
+        // diagonal folds, where the original's foot stays smooth and its sails stop at the ankle (independent review 5,
+        // 27.1 - 27.5 / 30.9 s). From the top of the ankle's bend (S = _Sock.w) down into the bend and along the foot.
+        float Srow = _Y0 + p.y * _Dy;
+        // (2 x over 8 cm: at 3 x from 4 cm below the bend's top an ankle pull folded a hard collar where the hold began - the
+        //  foot read as a block in a boot, review 9)
+        lw = max(lw, 2.0 * _KLeash * cw * smoothstep(_Sock.w + 0.01, _Sock.w - 0.07, Srow));
+        // (letting go: the lifted sail has no contact leash and only followed its springs - it lagged the patch and domed /
+        //  bunched into dark lumps for a frame or two at every release, review round 11)
+        lw = max(lw, _RelLeash);
+    }
+    else lw = _KRel;
+    return y + d * lw + dpin * LeashPin(p);
+}
+
+// p relative to its row's centre, in the row's plane (dx along x, dz along eB); S = its row parameter, eT / met: the
+// direction along the wales and dl / dS there
+void Frame(float3 p, out float dx, out float dz, out float3 eB, out float S, out float3 eT, out float met)
+{
+    float B; S = SockS(p, B, eB, eT, met);
+    float f = RowF(S); int j0 = (int)floor(f); float a = f - j0;
+    float2 ax = lerp(_Axis[j0], _Axis[j0 + 1], a);
+    dx = p.x - ax.x; dz = B - ax.y;
+}
+void AxisRel(float3 p, out float dx, out float dz)
+{
+    float3 eB, eT; float S, met; Frame(p, dx, dz, eB, S, eT, met);
+}
+
+// leg radius under the point p (bilinear in row / angle), and p relative to the row's centre (as AxisRel)
+float RadiusAt(float3 p, out float dx, out float dz, out float3 eB)
+{
+    float B, met; float3 eT; float S = SockS(p, B, eB, eT, met);
+    float f = RowF(S); int j0 = (int)floor(f); float a = f - j0;
+    float2 ax = lerp(_Axis[j0], _Axis[j0 + 1], a);
+    dx = p.x - ax.x; dz = B - ax.y;
+    float th = atan2(dx, dz) / TWO_PI; float g = (th - floor(th)) * _NU;
+    int i0 = WrapU((int)floor(g)); float b = g - floor(g); int i1 = WrapU(i0 + 1);
+    float r0 = lerp(_Rest[int2(i0, j0)].w, _Rest[int2(i1, j0)].w, b);
+    float r1 = lerp(_Rest[int2(i0, j0 + 1)].w, _Rest[int2(i1, j0 + 1)].w, b);
+    return lerp(r0, r1, a);
+}
+
+// the other leg's radius under q (in its rest frame) and q relative to its row's centre (as RadiusAt)
+float RadiusAtO(float3 q, out float dx, out float dz, out float3 eB)
+{
+    float B, met; float3 eT; float S = SockS(q, B, eB, eT, met);
+    float f = RowF(S); int j0 = (int)floor(f); float a = f - j0;
+    float2 ax = lerp(_OAxis[j0], _OAxis[j0 + 1], a);
+    dx = q.x - ax.x; dz = B - ax.y;
+    float th = atan2(dx, dz) / TWO_PI; float g = (th - floor(th)) * _NU;
+    int i0 = WrapU((int)floor(g)); float b = g - floor(g); int i1 = WrapU(i0 + 1);
+    float r0 = lerp(_ORest[int2(i0, j0)].w, _ORest[int2(i1, j0)].w, b);
+    float r1 = lerp(_ORest[int2(i0, j0 + 1)].w, _ORest[int2(i1, j0 + 1)].w, b);
+    return lerp(r0, r1, a);
+}
+
+// keeps a point of this leg's fabric _OtherGap off the other leg (pushed out in the other leg's row plane)
+float3 OffOtherLeg(float3 y)
+{
+    float f = clamp(y.y * _RelBins - 0.5, 0.0, _RelBins - 1.001); int b = (int)f;
+    float4 rl = lerp(_Rel[_RelBase + b], _Rel[_RelBase + b + 1], f - b);
+    float3 q = float3(rl.x * y.x + rl.y * y.z + rl.z, y.y, -rl.y * y.x + rl.x * y.z + rl.w);
+    float dxo, dzo; float3 eBo; float Ro = RadiusAtO(q, dxo, dzo, eBo) + _OtherGap;
+    float rho = max(sqrt(dxo * dxo + dzo * dzo), 1e-9);
+    if (rho >= Ro) return y;
+    q += (float3(dxo, 0.0, 0.0) + eBo * dzo) * ((Ro - rho) / rho);
+    float qx = q.x - rl.z, qz = q.z - rl.w;
+    return float3(rl.x * qx - rl.y * qz, q.y, rl.y * qx + rl.x * qz);
+}
+
+// ------------------------------------------------------------------------------------------------ rest tension
+[numthreads(8, 8, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float3 X = _Rest[p].xyz; float3 F = 0.0; float L[8];
+    for (int k = 0; k < 8; k++)
+    {
+        int2 o = OFFS[k]; int2 q = Nb(p, o);
+        float shr = k < 2 ? _Shrink.x : k < 4 ? _Shrink.y : _Shrink.z;
+        float kw = k < 4 ? 1.0 : _KDiag;
+        float3 D = _Rest[q].xyz - X;
+        F += (0.5 * kw * _KSoft * shr * Valid(p, o)) * D;
+        L[k] = length(D) * Valid(p, o);                               // 0 = no thread (beyond the first / last row)
+    }
+    // the leg carries the inward part by contact; the rest is what friction holds
+    float3 nr = PinRadial(X);
+    F -= min(dot(F, nr), 0.0) * nr;
+    _Out[p] = float4(F, 0.0);
+    _Out2[p] = float4(L[0], L[1], L[2], L[3]);
+    _Out3[p] = float4(L[4], L[5], L[6], L[7]);
+}
+
+[numthreads(8, 8, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float4 r = float4(_Rest[p].xyz, 0.0);
+    _Out[p] = r; _Out2[p] = r; _Out3[p] = r;
+}
+
+// prediction from the current / previous positions (after a reset, a grab or a release: the leash mode changed)
+[numthreads(8, 8, 1)]
+void Predict(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float4 x = _X[p];
+    _Out[p] = float4(PredictPos(x.xyz, _Xp[p].xyz, _Rest[p].xyz, Contact(x.w), p), x.w);
+}
+
+// ------------------------------------------------------------------------------------------------ pass 1
+[numthreads(8, 8, 1)]
+void Springs(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float4 yc = _P[p]; float3 y = yc.xyz;
+    float cw = Contact(yc.w), lift = 1.0 - cw;
+    float4 La = _L1[p], Lb = _L2[p];
+    float Ls[8] = { La.x, La.y, La.z, La.w, Lb.x, Lb.y, Lb.z, Lb.w };
+    float3 corr = -_F0[p].xyz * cw;
+    for (int k = 0; k < 8; k++)
+    {
+        float4 yq = _P[Nb(p, OFFS[k])];
+        float3 d = yq.xyz - y; float ln = max(length(d), 1e-9);       // (no thread: the neighbour is the node itself, d = 0)
+        float L = Ls[k];
+        float lock = k < 2 ? _Lock.x : k < 4 ? _Lock.y : _Lock.z;
+        float shr = k < 2 ? _Shrink.x : k < 4 ? _Shrink.y : _Shrink.z;
+        float kw = k < 4 ? 1.0 : _KDiag;
+        float wl = 0.5 * (lift + 1.0 - Contact(yq.w));               // how far this thread is off the leg
+        float e = ln - L * (1.0 - shr);                               // against its natural (unworn) length
+        float over = ln - L * (1.0 + lock);
+        float kc = (_KComp + _KCs * (1.0 - wl)) * kw;                 // on the leg it resists compression, in the air it folds
+        float c = kw * _KSoft * max(e, 0.0) + kc * min(e, 0.0) + (1.0 - _KSoft * kw) * max(over, 0.0);
+        corr += (0.5 * c / ln) * d;
+    }
+    _Out[p] = float4(y + corr * (_Omega / 8.0), yc.w);
+}
+
+// ------------------------------------------------------------------------------------------------ pass 2
+[numthreads(8, 8, 1)]
+void Finish(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float4 yc = _Y[p]; float3 y = yc.xyz; float cw = Contact(yc.w);
+    float4 rest = _Rest[p]; float3 X = rest.xyz;
+    float sq = 0.0; bool isPatch = false;            // how far the knit is pushed together here (0..1); a node the fingers hold
+    if (_Jam > 0.0)
+    {
+        // along the wales: the rows stay ordered (by their parameter S: height on the leg, round the bend, along the foot)
+        float4 yU = _Y[int2(p.x, min(p.y + 1, _NV - 1))], yD = _Y[int2(p.x, max(p.y - 1, 0))];
+        float vU = p.y + 1 < _NV ? 1.0 : 0.0, vD = p.y >= 1 ? 1.0 : 0.0;
+        float dx, dz, S, met; float3 eB, eT;
+        Frame(y, dx, dz, eB, S, eT, met);
+        float Bq, metq; float3 eBq, eTq;
+        float SU = SockS(yU.xyz, Bq, eBq, eTq, metq), SD = SockS(yD.xyz, Bq, eBq, eTq, metq);
+        // (only near the leg: a sail pulled well off the leg may hang below / wrap past the fabric it came from)
+        float nr = Near(yc.w), jw = JamW(yc.w);
+        // (in METRES against the threads' own worn lengths: round the ankle's bend a step in S is a different length on every
+        //  wale - 0.4 mm at the front, 2.6 mm at the heel - and fabric the hand had slid from the bend up onto the shin,
+        //  its rows a fraction of a millimetre apart as they are worn, counted as jammed there: a hard dark line across the
+        //  ankle. Where the fabric stays in place this is the same test as before)
+        float4 La = _L1[p];
+        float mU = (SU - S) * met, mD = (S - SD) * met;
+        float pvU = max((_Fold + (_Jam - _Fold) * jw * JamW(yU.w)) * La.z - mU, 0.0) * 0.5 * vU * min(nr, Near(yU.w));
+        float pvD = max((_Fold + (_Jam - _Fold) * JamW(yD.w) * jw) * La.w - mD, 0.0) * 0.5 * vD * min(nr, Near(yD.w));
+        // around the leg: angles about the tube's axis stay ordered
+        float4 yR = _Y[int2(WrapU(p.x + 1), p.y)], yL = _Y[int2(WrapU(p.x - 1), p.y)];
+        float dxR, dzR, dxL, dzL;
+        AxisRel(yR.xyz, dxR, dzR); AxisRel(yL.xyz, dxL, dzL);
+        float rho = max(sqrt(dx * dx + dz * dz), 1e-9), rhoL = max(sqrt(dxL * dxL + dzL * dzL), 1e-9);
+        float L0 = La.x, L0L = La.y;
+        float arc = (dxR * dz - dzR * dx) / rho;
+        float puR = max((_Fold + (_Jam - _Fold) * jw * JamW(yR.w)) * L0 - arc, 0.0) * 0.5 * min(nr, Near(yR.w));
+        float arcL = (dx * dzL - dz * dxL) / rhoL;
+        float puL = max((_Fold + (_Jam - _Fold) * JamW(yL.w) * jw) * L0L - arcL, 0.0) * 0.5 * min(nr, Near(yL.w));
+        float dth = (puL - puR) / rho;
+        // (turned about the tube's axis in the row's plane; moved along the wale)
+        y += float3(dz * dth, 0.0, 0.0) - eB * (dx * dth) + eT * (pvD - pvU);
+        // pushed together beyond its natural (unworn) size - 3/4 of the worn spacing along the leg, 1/2 round it - the knit
+        // can only wrinkle
+        float rv = min(vU > 0.5 ? mU / max(La.z, 1e-9) : 1.0, vD > 0.5 ? mD / max(La.w, 1e-9) : 1.0);
+        float ru = min(arc / max(L0, 1e-9), arcL / max(L0L, 1e-9));
+        sq = max(1.0 - smoothstep(0.45, 0.75, rv), 1.0 - smoothstep(0.38, 0.50, ru));
+    }
+    if (_Held > 0.5)
+    {
+        float2 gm = _Grip[p];                                         // joined to the grab through intact knit (GripMask)
+        // tether to the pinch: rest distances around (su) / along (sv) the leg from the grab point
+        float3 A = _PinchA.xyz;
+        float dth = p.x * (TWO_PI / _NU) - _GrabTheta + PI;
+        dth = dth - TWO_PI * floor(dth / TWO_PI) - PI;
+        float su = rest.w * dth, sv = _ZTex[p].x - _ZTex[int2(p.x, _GrabJ)].x;      // (along the node's own wale from the grab's row)
+        float g = sqrt(su * su + sv * sv);
+        float kk = max((g - _PinchR) / max(g, 1e-9), 0.0);
+        // (round the leg the tether may reach further than along it: a hand drawing the fabric away from the ankle takes
+        //  it from along the leg - the original's long straight-edged sail - instead of dragging the ring round it into
+        //  a detached cuff, review round 6)
+        float rU = _ReachU > 0.0 ? _ReachU : _Reach;
+        float tmax = _Gather * _PinchR + kk * sqrt(Sq((1.0 + _Lock.x * rU) * su) + Sq((1.0 + _Lock.y * _Reach) * sv));
+        // (the held ankle / top rows are not dragged along: the hand's reach is limited instead, TightsSim)
+        float rr = min(p.y, _NV - 1 - p.y); float fr = saturate((rr - _PinRows) / max(_PinFade, 1.0)); fr = fr * fr * (3.0 - 2.0 * fr);
+        fr *= 1.0 - _PinMask[p].g;
+        // THE FABRIC ROUND A PINCH GOES ALONG WITH IT. A knit passes a drag on through its loops: pinch a stocking and slide
+        // the pinch over the leg, and the fabric for centimetres around slides with it, less and less with distance - the
+        // fabric ahead is pushed together gently over a wide zone, the fabric behind drawn out, the fabric beside sheared.
+        // This lattice passed a drag on only through threads at their lock (the tether) and through the order of its rows:
+        // the fan behind the pinch came along as a taut block, the fabric beside it stayed, and where the two met the cells
+        // sheared flat and turned over - the fan slid OVER its neighbours as a sheet with a ruled edge, 'folded paper'
+        // (free-play sweep 2026-11-17, pulls 6 / 12 / 13 / 17: 700 cells inside out; keeping each cell's area, or locking
+        // the shear pairwise, did not converge in this solver - both tried). So, while the hand drags the pinch over the
+        // skin (_DragU: how far, on the surface - metres round the tube and along the wale; TightsSim), every node has come along
+        // at least exp(-g / L) of that way, g its distance from the grab point in the worn fabric: most right at the fingers
+        // - the fabric just ahead of them is pushed together most, a dark wedge, the fabric just behind drawn out most, as
+        // the original's knee pinch shows - and less and less further away. L grows with the drag (TightsCloth.DragField:
+        // 2 x, up to a hand's width), so the field does not squeeze the fabric ahead below half its spacing - further than
+        // that it piles up at the jam, as before. A node the threads pull further (the tether below) goes further.
+        if (_DragU.z > 0.0)
+        {
+            float wq = exp(-max(g - _PinchR, 0.0) / _DragU.z) * (1.0 - smoothstep(2.5 * _DragU.z, 3.5 * _DragU.z, g)) * fr * gm.g;
+            // (... and less and less toward fabric that is HELD - the top band under the skirt, the welt of a thigh-high, the
+            //  toe: over the last 8 cm before it. Carried up to the held rows by the whole drag, the fabric below a welt
+            //  was pushed into it and folded over - a tilted flap in the lace, sweep with thigh-highs 2026-11-17)
+            wq *= smoothstep(0.0, 0.08, min((rr - _PinRows) * _Dy, _TopPinY - X.y));
+            // (ROUND the leg only the side the hand is on goes along - within a radian of the grab, none beyond two: the far
+            //  side is held by the hoop the hand tightens. Without this an ankle pull turned the whole ring of fabric, heel
+            //  and instep included, round the leg - the 'cuff' of review round 6 again)
+            float2 tg = wq * float2(_DragU.x * (1.0 - smoothstep(1.0, 2.0, abs(dth))), _DragU.y);
+            float um = length(tg);
+            if (um > 1e-6)
+            {
+                float dxy, dzy, Sy, mety; float3 eBy, eTy; Frame(y, dxy, dzy, eBy, Sy, eTy, mety);
+                float rhoy = max(sqrt(dxy * dxy + dzy * dzy), 1e-9);
+                // where the node is on the surface now, from where it is worn
+                float dty = atan2(dxy, dzy) - p.x * (TWO_PI / _NU) + PI; dty = dty - TWO_PI * floor(dty / TWO_PI) - PI;
+                float2 uh = tg / um;
+                // (both in metres on the surface. Round the ankle's bend a step in S is a different length on every wale
+                //  - a third of a millimetre per row at the front, 2.6 mm at the heel - so the way along the wale is counted
+                //  in two parts: what lies below the bend's top at the bend's scale (the worn thread there / where the node
+                //  is now), what lies above it as it is. Counted in S alone, fabric slid from the instep up onto the shin
+                //  seemed to have come three times as far as it had and was left behind: a hard line across the ankle)
+                float SX = _Y0 + p.y * _Dy, scj = _Sock.w;
+                float metX = _L1[p].z / _Dy, metB = SX < scj ? (Sy < scj ? 0.5 * (metX + mety) : metX) : mety;
+                float along = (min(Sy, scj) - min(SX, scj)) * metB + (max(Sy, scj) - max(SX, scj));
+                float lag = um - dot(float2(dty * rest.w, along), uh);
+                if (lag > 0.0)
+                {
+                    float2 mv = uh * (lag * _DragK);
+                    float dtm = mv.x / rhoy;
+                    y += float3(dzy * dtm, 0.0, 0.0) - eBy * (dxy * dtm) + eTy * mv.y;
+                    // ... OVER the skin: as high above it as it was. (Moved along straight lines, the fabric bridged every
+                    //  hollow on the way - beside the Achilles tendon, over the instep - as flat sheets standing off the
+                    //  skin, shaded as see-through sails: salmon polygons round an ankle pinch seen from the side, orbit
+                    //  sweep 2026-11-17. The collision below only ever pushes out.)
+                    float dxn, dzn; float3 eBn; float Rn = RadiusAt(y, dxn, dzn, eBn);
+                    float rn = max(sqrt(dxn * dxn + dzn * dzn), 1e-9);
+                    y += (float3(dxn, 0.0, 0.0) + eBn * dzn) * ((Rn + max(yc.w, 0.0) - rn) / rn);
+                }
+            }
+        }
+        float3 d = y - A; float ln = max(length(d), 1e-9);
+        y = lerp(y, A + d * (min(ln, tmax) / ln), fr * gm.g);
+        // (the fingers hold a fold of fabric - a short line along the wale between finger and thumb, not a point: elongated
+        //  along the leg and bunched less that way. As a point the tip of every sail was a needle and its edges ran in as a
+        //  cusp; the original's tips are blunt corners on straight edges, independent reviews 4 - 7)
+        float el = max(_PinchElong, 1.0);
+        float ge = sqrt(su * su + Sq(sv / el));
+        if ((ge < _PinchR && gm.r > 0.5) || (p.x == _GrabI && p.y == _GrabJ))
+        {
+            float3 dX = X - _PinchC.xyz;
+            float ga = _GatherAlong > 0.0 ? _GatherAlong : _Gather;
+            y = A + float3(dX.x * _Gather, dX.y * ga, dX.z * _Gather);
+            isPatch = true;
+        }
+    }
+    // (no node moves more than _MaxStep in one substep: a tether or a jumping hand could otherwise carry fabric through the
+    //  leg within one step, and the collision - out from the row's centre - would let it out on the far side)
+    if (_MaxStep > 0.0) { float3 x0 = _X[p].xyz, dd = y - x0; float ld = length(dd); if (ld > _MaxStep) y = x0 + dd * (_MaxStep / ld); }
+    float dx2, dz2; float3 eB2; float R = RadiusAt(y, dx2, dz2, eB2);
+    float rho2 = max(sqrt(dx2 * dx2 + dz2 * dz2), 1e-9);
+    float pen = max(R - rho2, 0.0) / rho2;
+    y += (float3(dx2, 0.0, 0.0) + eB2 * dz2) * pen;
+    float h = rho2 - R;
+    // Gathered fabric lies ON the leg. Wrinkles of nylon are a millimetre or two high and the stretched tube presses them
+    // onto the skin; the lattice cannot make them (its cells are larger) and buckled instead into ONE fold standing 7 - 12 mm
+    // off the leg beside a pinch dragged over it - a ridge with a hard straight edge, the 'folded sheet of paper' of the
+    // free-play sweep (2026-11-17, pulls 6 / 12 / 13 / 17; cloth dump: lift 7.7 mm beside a 4 mm pinch). So fabric that is
+    // pushed together in its own plane and lifted only millimetres is pressed back onto the skin: the pile-up goes on ahead
+    // of the hand in the plane (_Jam), where the shader draws its wrinkles. Only while the fingers themselves are on the leg
+    // (TightsSim sets _Press per substep), and only fabric lifted millimetres: a tent or sail stands by its threads.
+    if (_Press > 0.0 && sq > 0.0 && h > 0.0 && !isPatch)
+    {
+        float pr = min(h, _Press * sq * (1.0 - smoothstep(_PressH0, _PressH1, h)));
+        y -= (float3(dx2, 0.0, 0.0) + eB2 * dz2) * (pr / rho2); h -= pr;
+    }
+    // the floor (the feet stand on it): nothing goes below it
+    if (_Floor.x != 0.0 || _Floor.y != 0.0 || _Floor.z != 0.0) y += _Floor.xyz * max(_Floor.w - dot(_Floor.xyz, y), 0.0);
+    // ... nor into the other leg (only fabric lifted off this one can reach it)
+    if (h > 0.0015 && _RelBins > 0.0) y = OffOtherLeg(y);
+    if (min(p.y, _NV - 1 - p.y) < _PinRows)
+    {
+        float3 pr = PinRest(p, X), nr = PinRadial(X);
+        y = pr + nr * (max(dot(y - pr, nr), 0.0) * PinFreeW(p));
+    }
+    else if (_PinMask[p].r > 0.5) { y = X; h = 0.0; }
+    if (!(dot(y - X, y - X) < 0.09)) { y = X; h = 0.0; }             // safety net: a node that ran away (or NaN) goes back
+    _Out[p] = float4(y, h);
+    _Out2[p] = float4(PredictPos(y, _X[p].xyz, X, Contact(h), p), h);        // for the next substep
+}
+
+// ------------------------------------------------------------------------------------------------ for the shaders
+[numthreads(8, 8, 1)]
+void Resolve(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    int2 pR = int2(WrapU(p.x + 1), p.y), pL = int2(WrapU(p.x - 1), p.y);
+    int2 pU = int2(p.x, min(p.y + 1, _NV - 1)), pD = int2(p.x, max(p.y - 1, 0));
+    float4 x = _X[p]; float3 X = _Rest[p].xyz;
+    float3 du = _X[pR].xyz - _X[pL].xyz, dv = _X[pU].xyz - _X[pD].xyz;
+    float3 dU = _Rest[pR].xyz - _Rest[pL].xyz, dV = _Rest[pU].xyz - _Rest[pD].xyz;
+    // in-plane deformation gradient in the orthonormal rest frame (eu around, ev along)
+    float lU = max(length(dU), 1e-9);
+    float3 eu = dU / lU;
+    float a2u = dot(dV, eu); float3 a2 = dV - a2u * eu; float a2v = max(length(a2), 1e-9);
+    float3 Fu = du / lU;
+    float3 Fv = (dv - a2u * Fu) / a2v;
+    float c11 = dot(Fu, Fu), c22 = dot(Fv, Fv), c12 = dot(Fu, Fv);
+    float tr = c11 + c22, df = c11 - c22;
+    float disc = sqrt(max(df * df + 4.0 * c12 * c12, 0.0));
+    float l1 = sqrt(max(0.5 * (tr + disc), 0.0)), l2 = sqrt(max(0.5 * (tr - disc), 0.0));
+    float2 dir = disc > 1e-6 ? float2(df, 2.0 * c12) / disc : float2(0.0, 0.0);      // (cos 2a, sin 2a) of the largest stretch
+    // (the normal over a wider stencil - two cells as well as one: folds of the lattice shaded as hard 1-cell creases,
+    //  'paper-like' to review round 6; the stretches above stay one-cell)
+    int2 pR2 = int2(WrapU(p.x + 2), p.y), pL2 = int2(WrapU(p.x - 2), p.y);
+    int2 pU2 = int2(p.x, min(p.y + 2, _NV - 1)), pD2 = int2(p.x, max(p.y - 2, 0));
+    float3 duW = du + 0.5 * (_X[pR2].xyz - _X[pL2].xyz), dvW = dv + 0.5 * (_X[pU2].xyz - _X[pD2].xyz);
+    float3 dUW = dU + 0.5 * (_Rest[pR2].xyz - _Rest[pL2].xyz), dVW = dV + 0.5 * (_Rest[pU2].xyz - _Rest[pD2].xyz);
+    float3 n = cross(duW, dvW), n0 = cross(dUW, dVW);                              // outward (theta = atan2(x, z) grows with i)
+    n = n / max(length(n), 1e-12); n0 = n0 / max(length(n0), 1e-12);
+    _OutDisp[p] = float4(x.xyz - X, max(x.w, 0.0));
+    _OutTens[p] = float4(l1, l2, dir);
+    _OutNrm[p] = float4(n - n0, 0.0);
+}
+
+// ------------------------------------------------------------------------------------------------ the grip (per grab)
+// a node's hole / ladder signed distances (m) in the leg's damage map (u round the leg from its wale's offset, z along it)
+float2 DmgSD(int2 q)
+{
+    float2 zt = _ZTex[q];
+    float u = q.x / (float)_NU + zt.y; u -= floor(u);
+    float v = clamp(zt.x - _DmgInfo.z, 0.00025, 0.99975);
+    int2 t = int2(min((int)(u * _DmgInfo.x), (int)_DmgInfo.x - 1), min((int)(v * _DmgInfo.y), (int)_DmgInfo.y - 1));
+    return (_DmgTex.Load(int3(t, 0)).rg - 0.5) * (2.0 * _DmgInfo.w);
+}
+
+[numthreads(8, 8, 1)]
+void GripMask(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float m = 1.0;
+    if (_DmgInfo.x > 0.0)
+    {
+        float dth = p.x * (TWO_PI / _NU) - _GrabTheta + PI; dth = dth - TWO_PI * floor(dth / TWO_PI) - PI;
+        float su = _Rest[p].w * dth, sv = _ZTex[p].x - _ZTex[int2(p.x, _GrabJ)].x;
+        if (su * su + sv * sv < 0.0144)                              // (within 12 cm: the drag field's reach)
+        {
+            int di = p.x - _GrabI; di -= _NU * (int)round(di / (float)_NU);
+            int dj = p.y - _GrabJ, n = max(abs(di), abs(dj));
+            // (grabbed at the edge of a hole: its own hole does not count until the line has left it)
+            bool inStart = DmgSD(int2(_GrabI, _GrabJ)).x < 0.0005;
+            float runL = 0.0, stepV = abs(dj) / max((float)n, 1.0) * _Dy;
+            for (int k = 1; k <= n; k++)
+            {
+                float f = k / (float)n;
+                int2 q = int2(WrapU(_GrabI + (int)round(di * f)), clamp(_GrabJ + (int)round(dj * f), 0, _NV - 1));
+                float2 sd = DmgSD(q);
+                if (sd.x < 0.0005) { if (!inStart) { m = 0.0; break; } }
+                else inStart = false;
+                if (sd.y < 0.0) { runL += stepV; if (runL > 0.004) { m = 0.0; break; } }
+            }
+        }
+    }
+    _OutGrip[p] = float2(m, m);
+}
+
+[numthreads(8, 8, 1)]
+void GripBlur(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = id.xy; if (p.x >= _NU || p.y >= _NV) return;
+    float s = 0.0;
+    for (int dj = -4; dj <= 4; dj++)
+        for (int di = -6; di <= 6; di++) s += _Grip[int2(WrapU(p.x + di), clamp(p.y + dj, 0, _NV - 1))].r;
+    _OutGrip[p] = float2(_Grip[p].r, s / 117.0);
+}
