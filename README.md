@@ -92,5 +92,5 @@ Cloth, tearing, shaders, performance and how to build it: **[docs/TECH.md](docs/
 
 ## Licence
 
-MIT (see [LICENSE](LICENSE)), except the third-party material listed there: the tonemapping LUT (GPL-3.0-or-later,
-from Blender) and the fonts (SIL Open Font License).
+MIT (see [LICENSE](LICENSE)), except the third-party material in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): the
+tonemapping LUT (GPL-3.0-or-later, from Blender) and the fonts (SIL Open Font License).
